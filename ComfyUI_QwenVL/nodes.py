@@ -14,7 +14,6 @@ import folder_paths
 import subprocess
 import uuid
 
-
 def tensor_to_pil(image_tensor, batch_index=0) -> Image:
     # Convert tensor of shape [batch, height, width, channels] at the batch_index to PIL Image
     image_tensor = image_tensor[batch_index].unsqueeze(0)
