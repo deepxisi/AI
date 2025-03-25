@@ -19,7 +19,7 @@ def tensor_to_pil(image_tensor, batch_index=0) -> Image:
     # Convert tensor of shape [batch, height, width, channels] at the batch_index to PIL Image
     image_tensor = image_tensor[batch_index].unsqueeze(0)
     i = 255.0 * image_tensor.cpu().numpy()
-    img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8).squeeze()
+    img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8).squeeze())
     return img
 
 
@@ -169,13 +169,17 @@ class Qwen2VL:
                     "video": processed_video_path,
                 })
 
-            # 处理图像输入
+                # 处理图像输入
             else:
                 print("deal image")
                 pil_image = tensor_to_pil(image)
-                # 确保图像尺寸适合MPS
-                if self.device.type == "mps":
-                    max_pixels = 512 * 512  # MPS设备上更严格的像素限制
+                # 确保图像尺寸适合当前设备
+                if self.device.type in ["mps", "cuda"]:
+                    if self.device.type == "mps":
+                        max_pixels = 512 * 512  # MPS设备上更严格的像素限制
+                    else:  # CUDA
+                        max_pixels = 1024 * 1024  # CUDA设备上更大的像素限制
+                    
                     current_pixels = pil_image.width * pil_image.height
                     
                     # 渐进式缩放直到满足要求
@@ -188,7 +192,14 @@ class Qwen2VL:
                             Image.LANCZOS
                         )
                         current_pixels = new_width * new_height
-                        print(f"Scaled image to {new_width}x{new_height} for MPS compatibility")
+                        print(f"Scaled image to {new_width}x{new_height} for {self.device.type.upper()} compatibility")
+                        
+                    # 对CUDA设备进行额外检查
+                    if self.device.type == "cuda":
+                        # 确保图像张量不会超过CUDA内存限制
+                        image_tensor = image.to(self.device)
+                        if image_tensor.element_size() * image_tensor.numel() > 2**30:  # 1GB限制
+                            return ("Error: Image tensor too large for CUDA device (max 1GB)",)
                 messages[0]["content"].insert(0, {
                     "type": "image",
                     "image": pil_image,
@@ -199,6 +210,13 @@ class Qwen2VL:
                 text = self.processor.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
                 )
+                
+                # 对CUDA设备进行额外内存检查
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                    free_mem, total_mem = torch.cuda.mem_get_info()
+                    if free_mem < 2**30:  # 剩余内存小于1GB
+                        return ("Error: Not enough CUDA memory available (need at least 1GB free)",)
                 print("deal messages", messages)
                 image_inputs, video_inputs = process_vision_info(messages)
                 
@@ -210,17 +228,21 @@ class Qwen2VL:
                     return_tensors="pt",
                 )
                 
-                # 对MPS设备进行额外检查
-                if self.device.type == "mps":
+                # 对MPS/CUDA设备进行额外检查
+                if self.device.type in ["mps", "cuda"]:
                     total_size = 0
                     for k, v in inputs.items():
                         if isinstance(v, torch.Tensor):
                             tensor_size = v.numel() * v.element_size()
                             total_size += tensor_size
-                            if tensor_size > 2**30:  # 单个张量超过1GB
+                            if self.device.type == "mps" and tensor_size > 2**30:  # MPS: 单个张量超过1GB
                                 return ("Error: Input tensor too large for MPS device (max 1GB per tensor)",)
-                    if total_size > 2**30:  # 总输入超过1GB
+                            elif self.device.type == "cuda" and tensor_size > 2**32:  # CUDA: 单个张量超过4GB
+                                return ("Error: Input tensor too large for CUDA device (max 4GB per tensor)",)
+                    if self.device.type == "mps" and total_size > 2**30:  # MPS: 总输入超过1GB
                         return ("Error: Total input size too large for MPS device (max 1GB total)",)
+                    elif self.device.type == "cuda" and total_size > 2**32:  # CUDA: 总输入超过4GB
+                        return ("Error: Total input size too large for CUDA device (max 4GB total)",)
             except Exception as e:
                 return (f"Error during input preparation: {str(e)}",)
             # 确保张量在正确设备上
@@ -263,7 +285,7 @@ class Qwen2VL:
             if video_path:
                 os.remove(processed_video_path)
 
-            return result
+            return (result[0],)
 
 
 class Qwen2:
